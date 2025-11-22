@@ -322,7 +322,7 @@ def sidebar_input_section():
             category_input = st.selectbox("카테고리", categories, index=default_cat_index, label_visibility="collapsed")
             
         with col_btn1:
-            if st.button("+", key="add_cat_btn", help="새 카테고리 추가"):
+            if st.button("＋", key="add_cat_btn", help="새 카테고리 추가", use_container_width=True):
                 add_item_dialog(current_cat_key, "카테고리")
 
         # 지출 성격
@@ -349,7 +349,7 @@ def sidebar_input_section():
                 method_input = st.selectbox("결제수단", st.session_state['payment_methods'], index=default_pay_index, label_visibility="collapsed")
             
             with col_btn2:
-                if st.button("+", key="add_pay_btn", help="새 결제수단 추가"):
+                if st.button("＋", key="add_pay_btn", help="새 결제수단 추가", use_container_width=True):
                     add_item_dialog('payment_methods', "결제수단")
 
             # 카드 선택 (항상 보여주되, 카드 결제가 아니면 '-' 선택 유도)
