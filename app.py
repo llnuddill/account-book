@@ -996,4 +996,11 @@ if __name__ == "__main__":
     init_session_state()
     sidebar_input_section()
     main_content()
+    
+    # 리비전 표기 (우측 하단)
+    st.markdown("""
+    <div style='position: fixed; bottom: 10px; right: 10px; color: #718096; font-size: 0.8rem; z-index: 9999;'>
+        Rev. 2025.11.23
+    </div>
+    """, unsafe_allow_html=True)
 
