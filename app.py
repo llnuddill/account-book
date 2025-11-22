@@ -520,6 +520,21 @@ def render_calendar(year, month, df):
     # CSS 스타일
     st.markdown("""
     <style>
+    .calendar-container {
+        display: grid;
+        grid-template-columns: repeat(8, 1fr);
+        gap: 5px; /* 가로 세로 간격 통일 */
+        margin-bottom: 20px;
+    }
+    .calendar-header {
+        text-align: center;
+        font-weight: bold;
+        padding: 5px;
+        color: #e2e8f0;
+        background-color: #2D3748;
+        border-radius: 4px;
+        margin-bottom: 5px;
+    }
     .calendar-cell {
         border: 1px solid #4a5568;
         border-radius: 8px;
@@ -528,25 +543,40 @@ def render_calendar(year, month, df):
         font-size: 0.85rem;
         background-color: #1E1E1E;
         color: #e2e8f0;
+        display: flex;
+        flex-direction: column;
+    }
+    .calendar-cell-empty {
+        background-color: transparent;
+        border: none;
+        min-height: 120px;
     }
     .calendar-date {
         font-weight: bold;
         margin-bottom: 5px;
         color: #e2e8f0;
         font-size: 1rem;
+        text-align: right;
     }
-    .cal-income { color: #48bb78; margin-bottom: 2px; }
-    .cal-expense { color: #f56565; margin-bottom: 2px; }
-    .cal-saving { color: #4299e1; margin-bottom: 2px; }
-    .cal-total { font-weight: bold; font-size: 0.85rem; margin-top: 4px; border-top: 1px dashed #718096; padding-top: 2px; color: #e2e8f0; }
+    .cal-income { color: #48bb78; margin-bottom: 2px; font-size: 0.8rem; }
+    .cal-expense { color: #f56565; margin-bottom: 2px; font-size: 0.8rem; }
+    .cal-saving { color: #4299e1; margin-bottom: 2px; font-size: 0.8rem; }
     .week-summary {
-        background-color: #1E1E1E;
+        background-color: #2D3748;
         border-radius: 8px;
         padding: 8px;
         min-height: 120px;
         border: 1px solid #4a5568;
         color: #e2e8f0;
         font-size: 0.85rem;
+        display: flex;
+        flex-direction: column;
+        justify_content: center;
+    }
+    .summary-row {
+        display: flex;
+        justify_content: space-between;
+        margin-bottom: 4px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -558,67 +588,74 @@ def render_calendar(year, month, df):
     # 달력 데이터 생성
     cal = calendar.monthcalendar(year, month)
     
+    # HTML 빌더 시작
+    html_content = '<div class="calendar-container">'
+    
     # 요일 헤더
-    cols = st.columns(8)
     days = ['일', '월', '화', '수', '목', '금', '토', '주간 합계']
-    for i, day in enumerate(days):
-        cols[i].markdown(f"<div style='text-align: center; font-weight: bold; padding: 5px; color: #e2e8f0;'>{day}</div>", unsafe_allow_html=True)
+    for day in days:
+        html_content += f"<div class='calendar-header'>{day}</div>"
         
     # 달력 그리기
     for week in cal:
-        cols = st.columns(8)
         weekly_income = 0
         weekly_expense = 0
         weekly_saving = 0
         
-        for i, day in enumerate(week):
-            with cols[i]:
-                if day == 0:
-                    st.markdown("<div class='calendar-cell' style='background-color: transparent; border: none;'></div>", unsafe_allow_html=True)
-                else:
-                    # 해당 날짜 데이터 가져오기
-                    day_data = monthly_data[monthly_data['날짜'].dt.day == day]
-                    
-                    # 주간 합계 계산용
-                    income_sum = day_data[day_data['구분']=='수입']['금액'].sum()
-                    expense_sum = day_data[day_data['구분']=='지출']['금액'].sum()
-                    saving_sum = day_data[day_data['구분']=='저축']['금액'].sum()
-                    
-                    weekly_income += income_sum
-                    weekly_expense += expense_sum
-                    weekly_saving += saving_sum
-                    
-                    html = f"<div class='calendar-cell'>"
-                    html += f"<div class='calendar-date'>{day}</div>"
-                    
-                    for _, row in day_data.iterrows():
-                        amt = row['금액']
-                        content = row['내용']
-                        # 내용이 너무 길면 자르기 (10자)
-                        if len(content) > 10:
-                            content = content[:9] + ".."
-                            
-                        if row['구분'] == '수입':
-                            html += f"<div class='cal-income'>{content}: +{amt:,.0f}</div>"
-                        elif row['구분'] == '지출':
-                            html += f"<div class='cal-expense'>{content}: -{amt:,.0f}</div>"
-                        elif row['구분'] == '저축':
-                            html += f"<div class='cal-saving'>{content}: {amt:,.0f}</div>"
-                            
-                    html += "</div>"
-                    st.markdown(html, unsafe_allow_html=True)
-        
-        # 주간 합계
-        with cols[7]:
-            html = f"<div class='week-summary'>"
-            html += f"<div class='calendar-date'>주간 합계</div>"
-            html += f"<div class='cal-income'>수입 : {weekly_income:,.0f}</div>"
-            html += f"<div class='cal-expense'>지출 : {weekly_expense:,.0f}</div>"
-            html += f"<div class='cal-saving'>저축 : {weekly_saving:,.0f}</div>"
-            html += "</div>"
-            
-            
-            st.markdown(html, unsafe_allow_html=True)
+        # 1. 일주일치 날짜 셀 생성
+        for day in week:
+            if day == 0:
+                html_content += "<div class='calendar-cell-empty'></div>"
+            else:
+                # 해당 날짜 데이터 가져오기
+                day_data = monthly_data[monthly_data['날짜'].dt.day == day]
+                
+                # 주간 합계 계산용
+                income_sum = day_data[day_data['구분']=='수입']['금액'].sum()
+                expense_sum = day_data[day_data['구분']=='지출']['금액'].sum()
+                saving_sum = day_data[day_data['구분']=='저축']['금액'].sum()
+                
+                weekly_income += income_sum
+                weekly_expense += expense_sum
+                weekly_saving += saving_sum
+                
+                cell_html = f"<div class='calendar-cell'>"
+                cell_html += f"<div class='calendar-date'>{day}</div>"
+                
+                for _, row in day_data.iterrows():
+                    amt = row['금액']
+                    content = row['내용']
+                    # 내용이 너무 길면 자르기
+                    if len(content) > 8:
+                        content = content[:7] + ".."
+                        
+                    if row['구분'] == '수입':
+                        cell_html += f"<div class='cal-income'>{content}: +{amt:,.0f}</div>"
+                    elif row['구분'] == '지출':
+                        cell_html += f"<div class='cal-expense'>{content}: -{amt:,.0f}</div>"
+                    elif row['구분'] == '저축':
+                        cell_html += f"<div class='cal-saving'>{content}: {amt:,.0f}</div>"
+                        
+                cell_html += "</div>"
+                html_content += cell_html
+
+        # 2. 주간 합계 셀 생성 (8번째 컬럼)
+        summary_html = f"""
+        <div class='week-summary'>
+            <div style='text-align: center; font-weight: bold; margin-bottom: 8px;'>주간 합계</div>
+            <div class='summary-row' style='color: #48bb78;'><span>수입</span><span>+{weekly_income:,.0f}</span></div>
+            <div class='summary-row' style='color: #f56565;'><span>지출</span><span>-{weekly_expense:,.0f}</span></div>
+            <div class='summary-row' style='color: #4299e1;'><span>저축</span><span>{weekly_saving:,.0f}</span></div>
+            <div style='border-top: 1px solid #718096; margin-top: 4px; padding-top: 4px; text-align: right; font-weight: bold;'>
+                {(weekly_income - weekly_expense - weekly_saving):+,.0f}
+            </div>
+        </div>
+        """
+        html_content += summary_html
+
+    html_content += "</div>" # End container
+    
+    st.markdown(html_content, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # 로그인 페이지
