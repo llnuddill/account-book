@@ -5,6 +5,8 @@ import altair as alt
 import gspread
 import calendar
 import textwrap
+import hashlib
+import secrets
 
 # -----------------------------------------------------------------------------
 # 커스텀 CSS 스타일링
@@ -12,6 +14,64 @@ import textwrap
 def apply_custom_css():
     # CSS 스타일링 제거 - 기본 Streamlit 스타일 사용
     pass
+
+# -----------------------------------------------------------------------------
+# 인증 관련 헬퍼 함수
+# -----------------------------------------------------------------------------
+def hash_password(password, salt=None):
+    """비밀번호 해싱 (SHA-256 + Salt)"""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    return hashlib.sha256((password + salt).encode()).hexdigest(), salt
+
+def verify_password(stored_password, stored_salt, provided_password):
+    """비밀번호 검증"""
+    return stored_password == hashlib.sha256((provided_password + stored_salt).encode()).hexdigest()
+
+def get_users_worksheet(spreadsheet):
+    """Users 시트 가져오기 (없으면 생성)"""
+    try:
+        return spreadsheet.worksheet("Users")
+    except:
+        ws = spreadsheet.add_worksheet(title="Users", rows=100, cols=5)
+        ws.append_row(["username", "password_hash", "salt", "created_at"])
+        return ws
+
+def load_users():
+    """사용자 목록 불러오기"""
+    spreadsheet = get_gsheet_connection()
+    if not spreadsheet:
+        return {}
+    
+    try:
+        ws = get_users_worksheet(spreadsheet)
+        records = ws.get_all_records()
+        # username을 키로 하는 dict 반환
+        return {r['username']: r for r in records}
+    except Exception as e:
+        st.error(f"사용자 데이터 로드 실패: {e}")
+        return {}
+
+def register_user(username, password):
+    """사용자 등록"""
+    spreadsheet = get_gsheet_connection()
+    if not spreadsheet:
+        return False, "Google Sheets 연결 실패"
+    
+    try:
+        ws = get_users_worksheet(spreadsheet)
+        # 중복 확인
+        existing_users = ws.col_values(1) # 첫 번째 컬럼 (username)
+        if username in existing_users:
+            return False, "이미 존재하는 아이디입니다."
+        
+        password_hash, salt = hash_password(password)
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        ws.append_row([username, password_hash, salt, created_at])
+        return True, "회원가입 성공!"
+    except Exception as e:
+        return False, f"회원가입 실패: {e}"
 
 # -----------------------------------------------------------------------------
 # Google Sheets 연동 헬퍼 함수
@@ -190,6 +250,12 @@ def save_settings_to_sheet():
 # 1. 초기 설정 및 데이터 관리 (Session State)
 # -----------------------------------------------------------------------------
 def init_session_state():
+    # 로그인 상태 초기화
+    if 'logged_in' not in st.session_state:
+        st.session_state['logged_in'] = False
+    if 'username' not in st.session_state:
+        st.session_state['username'] = None
+
     # 기본 데이터 초기화
     if 'data' not in st.session_state:
         st.session_state['data'] = load_data()
@@ -551,13 +617,36 @@ def render_calendar(year, month, df):
             html += f"<div class='cal-saving'>저축 : {weekly_saving:,.0f}</div>"
             html += "</div>"
             
+            
             st.markdown(html, unsafe_allow_html=True)
-        
-        # 주 간격 추가
-        st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 메인 컨텐츠
+# 로그인 페이지
+# -----------------------------------------------------------------------------
+def login_page():
+    st.markdown("<h1 style='text-align: center;'>💰 슈퍼 가계부 로그인</h1>", unsafe_allow_html=True)
+    
+    with st.form("login_form"):
+        username = st.text_input("아이디")
+        password = st.text_input("비밀번호", type="password")
+        submit = st.form_submit_button("로그인", use_container_width=True)
+        
+        if submit:
+            users = load_users()
+            if username in users:
+                user_data = users[username]
+                if verify_password(user_data['password_hash'], user_data['salt'], password):
+                    st.session_state['logged_in'] = True
+                    st.session_state['username'] = username
+                    st.success("로그인 성공!")
+                    st.rerun()
+                else:
+                    st.error("비밀번호가 일치하지 않습니다.")
+            else:
+                st.error("존재하지 않는 아이디입니다.")
+
+# -----------------------------------------------------------------------------
+# 3. 메인 콘텐츠 (탭 구성)
 # -----------------------------------------------------------------------------
 def main_content():
     df = st.session_state['data']
@@ -992,8 +1081,22 @@ if __name__ == "__main__":
     
     
     init_session_state()
-    sidebar_input_section()
-    main_content()
+    
+    if not st.session_state['logged_in']:
+        login_page()
+    else:
+        sidebar_input_section()
+        
+        # 사이드바 하단에 로그아웃 버튼 추가
+        with st.sidebar:
+            st.divider()
+            st.write(f"👤 **{st.session_state['username']}**")
+            if st.button("🚪 로그아웃", use_container_width=True):
+                st.session_state['logged_in'] = False
+                st.session_state['username'] = None
+                st.rerun()
+            
+        main_content()
     
     # 리비전 표기 (우측 하단)
     st.markdown("""
