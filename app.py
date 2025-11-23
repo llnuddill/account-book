@@ -93,7 +93,8 @@ def get_gsheet_connection():
 
 def load_data():
     """데이터 불러오기 (Sheets -> DataFrame)"""
-    columns = ['날짜', '구분', '세부구분', '카테고리', '내용', '금액', '결제수단', '카드명', '메모']
+    # 뱅크샐러드 스타일 스키마 + 앱 전용 '세부구분'
+    columns = ['날짜', '시간', '타입', '대분류', '소분류', '내용', '금액', '화폐', '결제수단', '메모', '세부구분']
     
     spreadsheet = get_gsheet_connection()
     if spreadsheet:
@@ -103,12 +104,41 @@ def load_data():
             if data:
                 df = pd.DataFrame(data)
                 
+                # --- 마이그레이션 로직 ---
+                # 1. '구분' -> '타입'
+                if '구분' in df.columns and '타입' not in df.columns:
+                    df.rename(columns={'구분': '타입'}, inplace=True)
+                
+                # 2. '카테고리' -> '대분류'
+                if '카테고리' in df.columns and '대분류' not in df.columns:
+                    df.rename(columns={'카테고리': '대분류'}, inplace=True)
+                
+                # 3. '카드명' 병합 (기존 '결제수단'이 단순 '신용카드' 등이고 '카드명'에 실제 카드 이름이 있는 경우)
+                if '카드명' in df.columns:
+                    if '결제수단' in df.columns:
+                        # 카드명이 있으면 결제수단으로 사용, 없으면 기존 결제수단 유지
+                        df['결제수단'] = df.apply(lambda x: x['카드명'] if x['카드명'] and x['카드명'] != '-' else x['결제수단'], axis=1)
+                    else:
+                        df['결제수단'] = df['카드명']
+                
+                # 4. 신규 컬럼 기본값 설정
+                if '시간' not in df.columns:
+                    df['시간'] = '00:00'
+                if '소분류' not in df.columns:
+                    df['소분류'] = ''
+                if '화폐' not in df.columns:
+                    df['화폐'] = 'KRW'
+                if '세부구분' not in df.columns:
+                    df['세부구분'] = '-' # 기본값
+
+                # -----------------------
+
                 # 데이터 타입 명시적 변환
                 if '날짜' in df.columns:
                     df['날짜'] = pd.to_datetime(df['날짜'])
                 
                 # 텍스트 컬럼들을 문자열로 변환
-                text_columns = ['구분', '세부구분', '카테고리', '내용', '결제수단', '카드명', '메모']
+                text_columns = ['타입', '대분류', '소분류', '내용', '화폐', '결제수단', '메모', '세부구분']
                 for col in text_columns:
                     if col in df.columns:
                         df[col] = df[col].astype(str)
@@ -125,6 +155,29 @@ def load_data():
                         else:
                             df[col] = ""
                 
+                # '시간' 컬럼을 datetime.time 객체로 변환 (데이터 에디터 호환성)
+                if '시간' in df.columns:
+                    # 1. 문자열로 변환 (이미 문자열일 수 있지만 안전하게)
+                    df['시간'] = df['시간'].astype(str)
+                    # 2. datetime 객체로 변환 후 time 부분만 추출
+                    # 형식이 안맞는 경우 00:00:00으로 처리
+                    def parse_time(t_str):
+                        try:
+                            return pd.to_datetime(t_str, format='%H:%M:%S').time()
+                        except:
+                            try:
+                                return pd.to_datetime(t_str, format='%H:%M').time()
+                            except:
+                                return datetime.strptime('00:00', '%H:%M').time()
+                                
+                    df['시간'] = df['시간'].apply(parse_time)
+
+                # 5. 지출 금액 음수 처리 (마이그레이션)
+                if '타입' in df.columns and '금액' in df.columns:
+                    # 지출이면서 금액이 양수인 경우 음수로 변환
+                    mask = (df['타입'] == '지출') & (df['금액'] > 0)
+                    df.loc[mask, '금액'] = df.loc[mask, '금액'] * -1
+
                 return df[columns] # 컬럼 순서 정렬
         except Exception as e:
             st.warning(f"데이터 불러오기 실패 (로컬 모드로 시작): {e}")
@@ -139,7 +192,12 @@ def save_data_to_sheet(df):
             worksheet = spreadsheet.sheet1
             # 날짜를 문자열로 변환하여 저장 (JSON 직렬화 문제 방지)
             save_df = df.copy()
-            save_df['날짜'] = save_df['날짜'].dt.strftime('%Y-%m-%d')
+            if '날짜' in save_df.columns:
+                save_df['날짜'] = save_df['날짜'].dt.strftime('%Y-%m-%d')
+            
+            # 시간도 문자열로 변환
+            if '시간' in save_df.columns:
+                save_df['시간'] = save_df['시간'].astype(str)
             
             # 시트 클리어 후 헤더 포함하여 전체 업데이트
             worksheet.clear()
@@ -316,16 +374,23 @@ def init_session_state():
     if 'pending_delete' not in st.session_state: st.session_state['pending_delete'] = []
 
 
-def save_data(date, division, sub_division, category, content, amount, method, card_name, memo):
+def save_data(date, time, type_val, sub_division, big_category, small_category, content, amount, currency, method, memo):
+    # 지출인 경우 금액을 음수로 저장
+    final_amount = amount
+    if type_val == '지출' and final_amount > 0:
+        final_amount = final_amount * -1
+        
     new_row = {
         '날짜': pd.to_datetime(date),
-        '구분': division,
+        '시간': str(time), # 시간은 문자열로 저장
+        '타입': type_val,
         '세부구분': sub_division,
-        '카테고리': category,
+        '대분류': big_category,
+        '소분류': small_category,
         '내용': content,
-        '금액': amount,
+        '금액': final_amount,
+        '화폐': currency,
         '결제수단': method,
-        '카드명': card_name,
         '메모': memo
     }
     st.session_state['data'] = pd.concat([st.session_state['data'], pd.DataFrame([new_row])], ignore_index=True)
@@ -353,6 +418,127 @@ def add_item_dialog(target_list_key, item_type_name):
             st.warning("이름을 입력해주세요.")
 
 # -----------------------------------------------------------------------------
+# 로그인 페이지
+# -----------------------------------------------------------------------------
+def login_page():
+    st.markdown("""
+        <div style='text-align: center; margin-top: 50px;'>
+            <h1>💰 슈퍼 가계부</h1>
+            <p>로그인이 필요합니다.</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        with st.form("login_form"):
+            username = st.text_input("아이디")
+            password = st.text_input("비밀번호", type="password")
+            
+            submitted = st.form_submit_button("로그인", use_container_width=True, type="primary")
+            
+            if submitted:
+                users = load_users()
+                if username in users:
+                    stored_hash = users[username]['password_hash']
+                    stored_salt = users[username]['salt']
+                    
+                    if verify_password(stored_hash, stored_salt, password):
+                        st.session_state['logged_in'] = True
+                        st.session_state['username'] = username
+                        st.success("로그인 성공!")
+                        st.rerun()
+                    else:
+                        st.error("비밀번호가 일치하지 않습니다.")
+                else:
+                    st.error("존재하지 않는 아이디입니다.")
+        
+        with st.expander("회원가입"):
+            with st.form("signup_form"):
+                new_user = st.text_input("새 아이디")
+                new_pw = st.text_input("새 비밀번호", type="password")
+                new_pw_confirm = st.text_input("비밀번호 확인", type="password")
+                
+                signup_submitted = st.form_submit_button("가입하기")
+                
+                if signup_submitted:
+                    if new_pw != new_pw_confirm:
+                        st.error("비밀번호가 일치하지 않습니다.")
+                    elif not new_user or not new_pw:
+                        st.warning("아이디와 비밀번호를 입력해주세요.")
+                    else:
+                        success, msg = register_user(new_user, new_pw)
+                        if success:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+# -----------------------------------------------------------------------------
+# 달력 렌더링 함수
+# -----------------------------------------------------------------------------
+def render_calendar(year, month, df):
+    # 해당 월의 데이터 필터링
+    monthly_df = df[(df['날짜'].dt.year == year) & (df['날짜'].dt.month == month)]
+    
+    # 달력 생성
+    cal = calendar.monthcalendar(year, month)
+    
+    # 요일 헤더
+    cols = st.columns(7)
+    days = ['월', '화', '수', '목', '금', '토', '일']
+    for idx, day in enumerate(days):
+        cols[idx].markdown(f"<div style='text-align: center; font-weight: bold; color: #4A5568;'>{day}</div>", unsafe_allow_html=True)
+    
+    # 달력 날짜 채우기
+    for week in cal:
+        cols = st.columns(7)
+        for idx, day in enumerate(week):
+            if day == 0:
+                cols[idx].write("")
+            else:
+                # 해당 날짜의 데이터 요약
+                day_str = f"{year}-{month:02d}-{day:02d}"
+                day_data = monthly_df[monthly_df['날짜'].dt.strftime('%Y-%m-%d') == day_str]
+                
+                income = day_data[day_data['타입']=='수입']['금액'].sum()
+                expense = day_data[day_data['타입']=='지출']['금액'].sum()
+                
+                content_html = f"<div style='text-align: center; height: 80px; border: 1px solid #E2E8F0; border-radius: 5px; padding: 5px; margin-bottom: 5px;'>"
+                content_html += f"<div style='font-weight: bold;'>{day}</div>"
+                
+                if income > 0:
+                    content_html += f"<div style='color: blue; font-size: 0.8rem;'>+{income:,.0f}</div>"
+                if expense != 0: # 지출은 음수이므로 0이 아니면 표시
+                    content_html += f"<div style='color: red; font-size: 0.8rem;'>{expense:,.0f}</div>"
+                    
+                content_html += "</div>"
+                
+                cols[idx].markdown(content_html, unsafe_allow_html=True)
+
+# -----------------------------------------------------------------------------
+# 월 선택 버튼 렌더링 함수
+# -----------------------------------------------------------------------------
+def render_month_selector(key_prefix, default_month=None):
+    if default_month is None:
+        default_month = datetime.now().month
+        
+    if key_prefix not in st.session_state:
+        st.session_state[key_prefix] = default_month
+        
+    current_selection = st.session_state[key_prefix]
+    
+    st.markdown("##### 월 선택")
+    
+    # 1~12월 (한 줄로 표시)
+    cols = st.columns(12)
+    for i in range(1, 13):
+        btn_type = "primary" if current_selection == i else "secondary"
+        if cols[i-1].button(f"{i}월", key=f"{key_prefix}_btn_{i}", type=btn_type, use_container_width=True):
+            st.session_state[key_prefix] = i
+            st.rerun()
+            
+    return st.session_state[key_prefix]
+
+# -----------------------------------------------------------------------------
 # 2. 사이드바 (입력 폼)
 # -----------------------------------------------------------------------------
 def sidebar_input_section():
@@ -366,9 +552,12 @@ def sidebar_input_section():
             </h2>
         """, unsafe_allow_html=True)
         
-        # 날짜 & 구분 (폼 외부에서 선택하여 즉시 반영)
-        date_input = st.date_input("날짜", datetime.today())
-        division_input = st.selectbox("구분", ["지출", "수입", "저축"], key="division_select")
+        # 날짜 & 시간 & 타입 (구분)
+        c1, c2 = st.columns([0.6, 0.4])
+        date_input = c1.date_input("날짜", datetime.today())
+        time_input = c2.time_input("시간", datetime.now().time())
+        
+        division_input = st.selectbox("타입", ["지출", "수입", "저축"], key="division_select")
         
         # 카테고리 로직
         if division_input == "수입": current_cat_key = 'cat_income'
@@ -377,21 +566,24 @@ def sidebar_input_section():
         
         categories = st.session_state[current_cat_key]
         
-        # 카테고리 추가 버튼 (컬럼 레이아웃)
-        st.markdown('<p style="font-size: 14px; font-weight: bold; margin-bottom: -10px;">카테고리</p>', unsafe_allow_html=True)
+        # 대분류 (구 카테고리) 추가 버튼 (컬럼 레이아웃)
+        st.markdown('<p style="font-size: 14px; font-weight: bold; margin-bottom: -10px;">대분류</p>', unsafe_allow_html=True)
         col_cat, col_btn1 = st.columns([0.8, 0.2], vertical_alignment="bottom")
         with col_cat:
             # 마지막 추가된 항목이 있으면 자동 선택
             default_cat_index = 0
             if st.session_state['last_added_item'] in categories:
                 default_cat_index = categories.index(st.session_state['last_added_item'])
-            category_input = st.selectbox("카테고리", categories, index=default_cat_index, label_visibility="collapsed")
+            category_input = st.selectbox("대분류", categories, index=default_cat_index, label_visibility="collapsed")
             
         with col_btn1:
-            if st.button("＋", key="add_cat_btn", help="새 카테고리 추가", use_container_width=True):
-                add_item_dialog(current_cat_key, "카테고리")
+            if st.button("＋", key="add_cat_btn", help="새 대분류 추가", use_container_width=True):
+                add_item_dialog(current_cat_key, "대분류")
 
-        # 지출 성격
+        # 소분류 (NEW)
+        small_category_input = st.text_input("소분류")
+
+        # 지출 성격 (세부구분 - 앱 로직 유지)
         sub_division = "-"
         if division_input == "지출":
             fixed_cats = ["주거/통신", "보험", "교통/차량"]
@@ -423,11 +615,16 @@ def sidebar_input_section():
             selected_card = st.selectbox("카드 선택 (카드 결제 시)", registered_cards)
 
         # -------------------------------------------------------
-        # 입력 폼 (내용, 금액, 메모)
+        # 입력 폼 (내용, 금액, 화폐, 메모)
         # -------------------------------------------------------
         with st.form("entry_form", clear_on_submit=True):
             content_input = st.text_input("내용")
-            amount_input = st.number_input("금액 (원)", min_value=0, step=1000, format="%d")
+            
+            c1, c2 = st.columns([0.7, 0.3])
+            with c1:
+                amount_input = st.number_input("금액", min_value=0, step=1000, format="%d")
+            with c2:
+                currency_input = st.selectbox("화폐", ["KRW", "USD", "JPY", "EUR", "CNY"])
             
             memo_input = st.text_area("메모", height=50)
             
@@ -437,15 +634,20 @@ def sidebar_input_section():
                 if amount_input <= 0:
                     st.warning("금액은 0보다 커야 합니다.")
                 else:
+                    # 결제수단 로직: 카드가 선택되었으면 카드명, 아니면 결제수단
+                    final_method = selected_card if selected_card != "-" else method_input
+                    
                     save_data(
                         date_input, 
+                        time_input,
                         division_input, 
                         sub_division, 
                         category_input, 
+                        small_category_input,
                         content_input, 
                         amount_input, 
-                        method_input, 
-                        selected_card if selected_card != "-" else "-", 
+                        currency_input,
+                        final_method, 
                         memo_input
                     )
                     st.success("저장 완료!")
@@ -459,228 +661,45 @@ def sidebar_input_section():
 # -----------------------------------------------------------------------------
 # 헬퍼 함수들 (삭제 확인, 데이터 업데이트)
 # -----------------------------------------------------------------------------
-@st.dialog("삭제 확인")
-def confirm_delete_dialog(delete_indices):
-    st.write(f"**{len(delete_indices)}개의 항목**을 삭제하시겠습니까?")
-    st.warning("이 작업은 되돌릴 수 없습니다.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("예, 삭제합니다", type="primary", use_container_width=True):
-            st.session_state['data'] = st.session_state['data'].drop(delete_indices).reset_index(drop=True)
-            save_data_to_sheet(st.session_state['data'])
-            st.session_state['pending_delete'] = []
-            st.success("삭제되었습니다.")
-            st.rerun()
-    with col2:
-        if st.button("취소", use_container_width=True):
-            st.session_state['pending_delete'] = []
-            st.rerun()
-
-def update_from_editor(edited_df, original_subset):
-    # 1. 삭제 체크된 행 확인 (즉시 삭제하지 않고 pending 상태로 저장)
+def update_from_editor(edited_df, original_df):
+    """데이터 에디터의 변경사항을 원본 데이터에 반영"""
+    # 1. 삭제 대기 목록 업데이트
     if '삭제' in edited_df.columns:
-        rows_to_delete = edited_df[edited_df['삭제'] == True]
-        if not rows_to_delete.empty:
-            delete_indices = rows_to_delete['original_index'].tolist()
-            st.session_state['pending_delete'] = delete_indices
-            return False  # 변경사항 없음 (아직 삭제 안함)
-
-    # 2. 수정된 행 처리
-    changes_made = False
-    for i, row in edited_df.iterrows():
+        to_delete = edited_df[edited_df['삭제']]
+        st.session_state['pending_delete'] = to_delete['original_index'].tolist()
+    
+    # 2. 값 수정 반영
+    # edited_df의 각 행을 순회하며 변경사항 적용
+    for index, row in edited_df.iterrows():
         org_idx = row['original_index']
         if pd.isna(org_idx): continue 
         
-        # 삭제 체크된 행은 스킵
-        if '삭제' in row and row['삭제']: continue
+        # 원본 데이터프레임의 해당 인덱스 행 업데이트
+        for col in row.index:
+            if col in ['삭제', 'original_index']: continue
+            if col in st.session_state['data'].columns:
+                val = row[col]
+                # 날짜 컬럼인 경우 datetime으로 변환
+                if col == '날짜':
+                    val = pd.to_datetime(val)
+                st.session_state['data'].at[org_idx, col] = val
+    
+    # 변경사항 저장
+    save_data_to_sheet(st.session_state['data'])
 
-        # 값 할당
-        st.session_state['data'].at[org_idx, '날짜'] = pd.to_datetime(row['날짜'])
-        st.session_state['data'].at[org_idx, '구분'] = row['구분']
-        st.session_state['data'].at[org_idx, '세부구분'] = row['세부구분']
-        st.session_state['data'].at[org_idx, '카테고리'] = row['카테고리']
-        st.session_state['data'].at[org_idx, '내용'] = row['내용']
-        st.session_state['data'].at[org_idx, '금액'] = row['금액']
-        st.session_state['data'].at[org_idx, '결제수단'] = row['결제수단']
-        st.session_state['data'].at[org_idx, '카드명'] = row['카드명']
-        st.session_state['data'].at[org_idx, '메모'] = row['메모']
+@st.dialog("삭제 확인")
+def confirm_delete_dialog(delete_indices):
+    st.write(f"{len(delete_indices)}개의 항목을 삭제하시겠습니까?")
+    if st.button("확인", type="primary"):
+        # 인덱스로 삭제
+        st.session_state['data'] = st.session_state['data'].drop(delete_indices)
+        # 인덱스 재설정 (선택사항, 하지만 보통 유지하는게 안전)
+        st.session_state['data'] = st.session_state['data'].reset_index(drop=True)
         
-        changes_made = True
-        
-    if changes_made:
         save_data_to_sheet(st.session_state['data'])
-        
-    return changes_made
-
-# -----------------------------------------------------------------------------
-# 달력 렌더링 함수
-# -----------------------------------------------------------------------------
-def render_calendar(year, month, df):
-    # CSS 스타일
-    st.markdown("""
-    <style>
-    .calendar-container {
-        display: grid;
-        grid-template-columns: repeat(8, 1fr);
-        gap: 5px; /* 가로 세로 간격 통일 */
-        margin-bottom: 20px;
-    }
-    .calendar-header {
-        text-align: center;
-        font-weight: bold;
-        padding: 5px;
-        color: #e2e8f0;
-        background-color: #2D3748;
-        border-radius: 4px;
-        margin-bottom: 5px;
-    }
-    .calendar-cell {
-        border: 1px solid #4a5568;
-        border-radius: 8px;
-        padding: 8px;
-        min-height: 120px;
-        font-size: 0.85rem;
-        background-color: #1E1E1E;
-        color: #e2e8f0;
-        display: flex;
-        flex-direction: column;
-    }
-    .calendar-cell-empty {
-        background-color: transparent;
-        border: none;
-        min-height: 120px;
-    }
-    .calendar-date {
-        font-weight: bold;
-        margin-bottom: 5px;
-        color: #e2e8f0;
-        font-size: 1rem;
-        text-align: right;
-    }
-    .cal-income { color: #48bb78; margin-bottom: 2px; font-size: 0.8rem; }
-    .cal-expense { color: #f56565; margin-bottom: 2px; font-size: 0.8rem; }
-    .cal-saving { color: #4299e1; margin-bottom: 2px; font-size: 0.8rem; }
-    .week-summary {
-        background-color: #2D3748;
-        border-radius: 8px;
-        padding: 8px;
-        min-height: 120px;
-        border: 1px solid #4a5568;
-        color: #e2e8f0;
-        font-size: 0.85rem;
-        display: flex;
-        flex-direction: column;
-        justify_content: center;
-    }
-    .summary-row {
-        display: flex;
-        justify_content: space-between;
-        margin-bottom: 4px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # 데이터 필터링
-    mask = (df['날짜'].dt.year == year) & (df['날짜'].dt.month == month)
-    monthly_data = df[mask]
-    
-    # 달력 데이터 생성
-    cal = calendar.monthcalendar(year, month)
-    
-    # HTML 빌더 시작
-    html_content = '<div class="calendar-container">'
-    
-    # 요일 헤더
-    days = ['일', '월', '화', '수', '목', '금', '토', '주간 합계']
-    for day in days:
-        html_content += f"<div class='calendar-header'>{day}</div>"
-        
-    # 달력 그리기
-    for week in cal:
-        weekly_income = 0
-        weekly_expense = 0
-        weekly_saving = 0
-        
-        # 1. 일주일치 날짜 셀 생성
-        for day in week:
-            if day == 0:
-                html_content += "<div class='calendar-cell-empty'></div>"
-            else:
-                # 해당 날짜 데이터 가져오기
-                day_data = monthly_data[monthly_data['날짜'].dt.day == day]
-                
-                # 주간 합계 계산용
-                income_sum = day_data[day_data['구분']=='수입']['금액'].sum()
-                expense_sum = day_data[day_data['구분']=='지출']['금액'].sum()
-                saving_sum = day_data[day_data['구분']=='저축']['금액'].sum()
-                
-                weekly_income += income_sum
-                weekly_expense += expense_sum
-                weekly_saving += saving_sum
-                
-                cell_html = f"<div class='calendar-cell'>"
-                cell_html += f"<div class='calendar-date'>{day}</div>"
-                
-                for _, row in day_data.iterrows():
-                    amt = row['금액']
-                    content = row['내용']
-                    # 내용이 너무 길면 자르기
-                    if len(content) > 8:
-                        content = content[:7] + ".."
-                        
-                    if row['구분'] == '수입':
-                        cell_html += f"<div class='cal-income'>{content}: +{amt:,.0f}</div>"
-                    elif row['구분'] == '지출':
-                        cell_html += f"<div class='cal-expense'>{content}: -{amt:,.0f}</div>"
-                    elif row['구분'] == '저축':
-                        cell_html += f"<div class='cal-saving'>{content}: {amt:,.0f}</div>"
-                        
-                cell_html += "</div>"
-                html_content += cell_html
-
-        # 2. 주간 합계 셀 생성 (8번째 컬럼)
-        summary_html = f"""
-        <div class='week-summary'>
-            <div style='text-align: center; font-weight: bold; margin-bottom: 8px;'>주간 합계</div>
-            <div class='summary-row' style='color: #48bb78;'><span>수입</span><span>+{weekly_income:,.0f}</span></div>
-            <div class='summary-row' style='color: #f56565;'><span>지출</span><span>-{weekly_expense:,.0f}</span></div>
-            <div class='summary-row' style='color: #4299e1;'><span>저축</span><span>{weekly_saving:,.0f}</span></div>
-            <div style='border-top: 1px solid #718096; margin-top: 4px; padding-top: 4px; text-align: right; font-weight: bold;'>
-                {(weekly_income - weekly_expense - weekly_saving):+,.0f}
-            </div>
-        </div>
-        """
-        html_content += summary_html
-
-    html_content += "</div>" # End container
-    
-    st.markdown(html_content, unsafe_allow_html=True)
-
-# -----------------------------------------------------------------------------
-# 로그인 페이지
-# -----------------------------------------------------------------------------
-def login_page():
-    st.markdown("<h1 style='text-align: center;'>💰 슈퍼 가계부 로그인</h1>", unsafe_allow_html=True)
-    
-    with st.form("login_form"):
-        username = st.text_input("아이디")
-        password = st.text_input("비밀번호", type="password")
-        submit = st.form_submit_button("로그인", use_container_width=True)
-        
-        if submit:
-            users = load_users()
-            if username in users:
-                user_data = users[username]
-                if verify_password(user_data['password_hash'], user_data['salt'], password):
-                    st.session_state['logged_in'] = True
-                    st.session_state['username'] = username
-                    st.success("로그인 성공!")
-                    st.rerun()
-                else:
-                    st.error("비밀번호가 일치하지 않습니다.")
-            else:
-                st.error("존재하지 않는 아이디입니다.")
+        st.session_state['pending_delete'] = []
+        st.success("삭제되었습니다.")
+        st.rerun()
 
 # -----------------------------------------------------------------------------
 # 3. 메인 콘텐츠 (탭 구성)
@@ -696,15 +715,14 @@ def main_content():
     cards = ["-"] + list(st.session_state['cards_info'].keys())
     
     # 탭 구성
-    tab1, tab_cal, tab2, tab3, tab4 = st.tabs(["📊 월별 리포트", "📅 달력 보기", "📋 전체 내역", "📈 분석", "⚙️ 설정"])
+    tab1, tab_cal, tab_cat, tab2, tab3, tab4 = st.tabs(["📊 월별 리포트", "📅 달력 보기", "📂 카테고리별 보기", "📋 전체 내역", "📈 분석", "⚙️ 설정"])
     
     # --- [Tab 1] 월별 리포트 & 카드 실적 ---
     with tab1:
-        col1, col2 = st.columns(2)
         available_years = sorted(st.session_state['available_years'])
-        search_year = col1.selectbox("연도", available_years, index=len(available_years)-1 if available_years else 0)
-
-        search_month = col2.selectbox("월", range(1, 13), index=datetime.now().month-1)
+        search_year = st.selectbox("연도", available_years, index=len(available_years)-1 if available_years else 0, key="tab1_year")
+        
+        search_month = render_month_selector("tab1_month")
 
         if not df.empty:
             monthly_df = df[(df['날짜'].dt.year == search_year) & (df['날짜'].dt.month == search_month)]
@@ -712,15 +730,15 @@ def main_content():
             monthly_df = pd.DataFrame(columns=df.columns)
 
         # 1. 기본 요약
-        st.markdown(f"### 📌 {search_month}월 요약")
+        st.markdown(f"### 📋 {search_month}월 요약")
         if not monthly_df.empty:
-            income = monthly_df[monthly_df['구분']=='수입']['금액'].sum()
-            expense = monthly_df[monthly_df['구분']=='지출']['금액'].sum()
-            saving = monthly_df[monthly_df['구분']=='저축']['금액'].sum()
+            income = monthly_df[monthly_df['타입']=='수입']['금액'].sum()
+            expense = monthly_df[monthly_df['타입']=='지출']['금액'].sum()
+            saving = monthly_df[monthly_df['타입']=='저축']['금액'].sum()
             
             m1, m2, m3 = st.columns(3)
             m1.metric("총 수입", f"{income:,.0f}원")
-            m2.metric("총 지출", f"{expense:,.0f}원")
+            m2.metric("총 지출", f"{expense:,.0f}원") # 음수로 표시됨
             m3.metric("총 저축", f"{saving:,.0f}원")
         else:
             st.info("데이터가 없습니다.")
@@ -728,12 +746,12 @@ def main_content():
         st.divider()
 
         # [NEW] 2. 상세 내역 및 지출 분석 (인라인 수정)
-        col_detail, col_analysis = st.columns([0.65, 0.35])
+        col_detail, col_analysis = st.columns([0.75, 0.25])
         
         with col_detail:
             # [NEW] 고정 지출 섹션 (상단 배치)
             fh_col1, fh_col2 = st.columns([0.5, 0.5])
-            fh_col1.subheader("📌 고정 지출")
+            fh_col1.subheader("🔒 고정 지출")
             
             fixed_expenses = pd.DataFrame()
             if not monthly_df.empty:
@@ -755,13 +773,15 @@ def main_content():
                     column_config={
                         "삭제": st.column_config.CheckboxColumn("삭제", width="small"),
                         "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
-                        "구분": st.column_config.SelectboxColumn("구분", options=["지출", "수입", "저축"], required=True),
+                        "시간": st.column_config.TimeColumn("시간", format="HH:mm"),
+                        "타입": st.column_config.SelectboxColumn("타입", options=["지출", "수입", "저축"], required=True),
                         "세부구분": st.column_config.SelectboxColumn("세부구분", options=["고정지출", "비고정지출", "-"], required=True),
-                        "카테고리": st.column_config.SelectboxColumn("카테고리", options=all_categories, required=True),
+                        "대분류": st.column_config.SelectboxColumn("대분류", options=all_categories, required=True),
+                        "소분류": st.column_config.TextColumn("소분류"),
                         "내용": st.column_config.TextColumn("내용", required=True),
                         "금액": st.column_config.NumberColumn("금액", format="%d원", step=1000, required=True),
-                        "결제수단": st.column_config.SelectboxColumn("결제수단", options=payment_methods),
-                        "카드명": st.column_config.SelectboxColumn("카드명", options=cards),
+                        "화폐": st.column_config.SelectboxColumn("화폐", options=["KRW", "USD", "JPY", "EUR", "CNY"]),
+                        "결제수단": st.column_config.SelectboxColumn("결제수단", options=payment_methods + cards), # 카드 포함
                         "메모": st.column_config.TextColumn("메모"),
                         "original_index": None,
                     },
@@ -788,17 +808,17 @@ def main_content():
 
             # 비고정 지출 섹션
             dh_col1, dh_col2 = st.columns([0.5, 0.5])
-            dh_col1.subheader("📄 비고정 지출")
+            dh_col1.subheader("🛒 비고정 지출")
             
             if not monthly_df.empty:
                 # 고정지출 제외
                 detail_df = monthly_df[monthly_df['세부구분'] != '고정지출'].copy()
                 
                 if not detail_df.empty:
-                    variable_sum = detail_df[detail_df['구분'] == '지출']['금액'].sum() 
-                    variable_expense_sum = detail_df[detail_df['구분'] == '지출']['금액'].sum()
+                    variable_sum = detail_df[detail_df['타입'] == '지출']['금액'].sum() 
+                    variable_expense_sum = detail_df[detail_df['타입'] == '지출']['금액'].sum()
                     dh_col2.markdown(f"<h3 style='text-align: right; color: #FF4B4B;'>{variable_expense_sum:,.0f}원</h3>", unsafe_allow_html=True)
-
+                    
                     # 날짜 기준 내림차순 정렬
                     display_df = detail_df.sort_values(by="날짜", ascending=False)
                     display_df['original_index'] = display_df.index # 원본 인덱스 저장
@@ -812,13 +832,15 @@ def main_content():
                         column_config={
                             "삭제": st.column_config.CheckboxColumn("삭제", width="small"),
                             "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
-                            "구분": st.column_config.SelectboxColumn("구분", options=["지출", "수입", "저축"], required=True),
+                            "시간": st.column_config.TimeColumn("시간", format="HH:mm"),
+                            "타입": st.column_config.SelectboxColumn("타입", options=["지출", "수입", "저축"], required=True),
                             "세부구분": st.column_config.SelectboxColumn("세부구분", options=["고정지출", "비고정지출", "-"], required=True),
-                            "카테고리": st.column_config.SelectboxColumn("카테고리", options=all_categories, required=True),
+                            "대분류": st.column_config.SelectboxColumn("대분류", options=all_categories, required=True),
+                            "소분류": st.column_config.TextColumn("소분류"),
                             "내용": st.column_config.TextColumn("내용", required=True),
                             "금액": st.column_config.NumberColumn("금액", format="%d원", step=1000, required=True),
-                            "결제수단": st.column_config.SelectboxColumn("결제수단", options=payment_methods),
-                            "카드명": st.column_config.SelectboxColumn("카드명", options=cards),
+                            "화폐": st.column_config.SelectboxColumn("화폐", options=["KRW", "USD", "JPY", "EUR", "CNY"]),
+                            "결제수단": st.column_config.SelectboxColumn("결제수단", options=payment_methods + cards),
                             "메모": st.column_config.TextColumn("메모"),
                             "original_index": None, # 화면에서 숨김
                         },
@@ -847,29 +869,27 @@ def main_content():
 
 
         with col_analysis:
-            st.subheader("🍩 지출 분석")
+            st.subheader("📉 지출 분석")
             if not monthly_df.empty:
-                expense_df = monthly_df[monthly_df['구분'] == '지출']
+                expense_df = monthly_df[monthly_df['타입'] == '지출']
                 if not expense_df.empty:
-                    chart_data = expense_df.groupby('카테고리')['금액'].sum().reset_index()
+                    # 카테고리별 지출 합계 표 (내용별 지출 합계와 동일한 스타일)
+                    category_group = expense_df.groupby('대분류')['금액'].sum().reset_index()
+                    category_group = category_group.sort_values(by='금액', ascending=True) # 음수니까 오름차순이 큰 지출
                     
-                    base = alt.Chart(chart_data).encode(
-                        theta=alt.Theta("금액", stack=True)
+                    # 동적 높이 계산
+                    height_cat = (len(category_group) + 1) * 35 + 3
+                    
+                    st.dataframe(
+                        category_group.style.format({"금액": "{:,.0f}원"}),
+                        column_config={
+                            "대분류": st.column_config.TextColumn("카테고리"),
+                            # "금액": st.column_config.NumberColumn("금액", format="%d원"),
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        height=height_cat
                     )
-                    
-                    pie = base.mark_arc(outerRadius=120).encode(
-                        color=alt.Color("카테고리"),
-                        order=alt.Order("금액", sort="descending"),
-                        tooltip=["카테고리", alt.Tooltip("금액", format=",")]
-                    )
-                    
-                    text = base.mark_text(radius=140).encode(
-                        text=alt.Text("금액", format=","),
-                        order=alt.Order("금액", sort="descending"),
-                        color=alt.value("white") 
-                    )
-                    
-                    st.altair_chart(pie + text, use_container_width=True)
                 else:
                     st.info("지출 내역이 없습니다.")
             else:
@@ -884,12 +904,13 @@ def main_content():
             st.warning("등록된 카드가 없습니다. '설정' 탭에서 카드를 등록해주세요.")
         else:
             # 카드명이 '-'가 아니고, 실제 등록된 카드인 경우만 필터링
-            valid_cards = [c for c in monthly_df['카드명'].unique() if c in st.session_state['cards_info']]
-            card_spend = monthly_df[monthly_df['카드명'].isin(valid_cards)].groupby('카드명')['금액'].sum()
+            valid_cards = [c for c in monthly_df['결제수단'].unique() if c in st.session_state['cards_info']]
+            card_spend = monthly_df[monthly_df['결제수단'].isin(valid_cards)].groupby('결제수단')['금액'].sum()
             
             # 등록된 모든 카드에 대해 표시 (사용액 0원이라도)
             for card_name, tiers in st.session_state['cards_info'].items():
-                current_amount = card_spend.get(card_name, 0)
+                # 지출은 음수이므로 절대값으로 계산
+                current_amount = abs(card_spend.get(card_name, 0))
                 
                 with st.expander(f"💳 **{card_name}** (사용액: {current_amount:,.0f}원)", expanded=True):
                     sorted_tiers = sorted(tiers, key=lambda x: x['limit'])
@@ -912,36 +933,122 @@ def main_content():
                             else:
                                 st.info(f"{status_icon}\n\n남은 금액: {diff:,.0f}원\n\n혜택: {benefit}")
 
-    # --- [Tab 2] 연간 리포트 ---
     # --- [Tab 2] 달력 보기 ---
     with tab_cal:
         st.subheader("📅 월별 달력")
-        c1, c2 = st.columns(2)
         available_years = sorted(st.session_state['available_years'])
-        cal_year = c1.selectbox("연도", available_years, index=len(available_years)-1 if available_years else 0, key="cal_year")
-        cal_month = c2.selectbox("월", range(1, 13), index=datetime.now().month-1, key="cal_month")
+        cal_year = st.selectbox("연도", available_years, index=len(available_years)-1 if available_years else 0, key="cal_year_box")
+        
+        cal_month = render_month_selector("cal_month")
         
         st.divider()
         render_calendar(cal_year, cal_month, df)
 
-    # --- [Tab 3] 분석 (연간 리포트) ---
-    with tab3:
-        if df.empty:
-            st.info("데이터가 없습니다.")
+    # --- [Tab 3] 카테고리별 보기 ---
+    with tab_cat:
+        st.subheader("📂 카테고리별 내역")
+        
+        # 1. 연도/월 선택
+        available_years = sorted(st.session_state['available_years'])
+        cat_year = st.selectbox("연도", available_years, index=len(available_years)-1 if available_years else 0, key="cat_year_box")
+        
+        cat_month = render_month_selector("cat_month_selector")
+        
+        # 2. 해당 월 데이터 필터링
+        if not df.empty:
+            monthly_cat_df = df[(df['날짜'].dt.year == cat_year) & (df['날짜'].dt.month == cat_month)]
         else:
-            year_select = st.selectbox("연도 확인", available_years, key='year_select_tab2', index=len(available_years)-1)
-            
-            year_df = df[df['날짜'].dt.year == year_select].copy()
-            if not year_df.empty:
-                year_df['월'] = year_df['날짜'].dt.month
-                pivot = year_df.groupby(['월', '구분'])['금액'].sum().unstack(fill_value=0)
-                st.bar_chart(pivot)
-                st.dataframe(pivot.style.format("{:,.0f}원"), use_container_width=True)
-            else:
-                st.write("해당 연도 데이터가 없습니다.")
+            monthly_cat_df = pd.DataFrame(columns=df.columns)
 
-    # --- [Tab 3] 데이터 관리 ---
-    # --- [Tab 2] 전체 내역 (데이터 관리) ---
+        # 3. 카테고리별 합계 계산
+        cat_sums = {}
+        if not monthly_cat_df.empty:
+            cat_sums = monthly_cat_df.groupby('대분류')['금액'].sum().to_dict()
+        
+        # 세션 상태 초기화
+        if 'selected_cat_view' not in st.session_state:
+            st.session_state['selected_cat_view'] = all_categories[0] if all_categories else None
+
+        # 카테고리 버튼 그리드 생성
+        st.markdown("##### 카테고리 선택")
+        cols = st.columns(5)  # 5열 그리드
+        for idx, category in enumerate(all_categories):
+            col = cols[idx % 5]
+            # 현재 선택된 카테고리는 primary 스타일로 표시
+            btn_type = "primary" if st.session_state['selected_cat_view'] == category else "secondary"
+            
+            # 금액 표시
+            amount = cat_sums.get(category, 0)
+            label = f"{category}\n({amount:,.0f}원)"
+            
+            if col.button(label, key=f"cat_btn_{idx}", type=btn_type, use_container_width=True):
+                st.session_state['selected_cat_view'] = category
+                st.rerun()
+        
+        st.divider()
+
+        selected_category = st.session_state['selected_cat_view']
+        
+        if selected_category:
+            # 해당 카테고리 데이터 필터링 (월별 필터링된 데이터 사용)
+            cat_df = monthly_cat_df[monthly_cat_df['대분류'] == selected_category].copy()
+            
+            if not cat_df.empty:
+                # 요약 정보
+                total_amount = cat_df['금액'].sum()
+                count = len(cat_df)
+                
+                c1, c2 = st.columns(2)
+                c1.metric("총 금액", f"{total_amount:,.0f}원")
+                c2.metric("건수", f"{count}건")
+                
+                st.divider()
+                
+                # 데이터 표시 (2단 컬럼 구성)
+                col_list, col_breakdown = st.columns([0.6, 0.4])
+                
+                with col_list:
+                    st.markdown("###### 📝 상세 내역")
+                    # 동적 높이 계산
+                    height_list = (len(cat_df) + 1) * 35 + 3
+                    st.dataframe(
+                        cat_df.sort_values(by="날짜", ascending=False).style.format({"금액": "{:,.0f}원"}),
+                        column_config={
+                            "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
+                            # "금액": st.column_config.NumberColumn("금액", format="%d원"), # style로 대체
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        height=height_list
+                    )
+                
+                with col_breakdown:
+                    st.markdown("###### 📊 내용별 지출 합계")
+                    # 내용별 그룹화 및 정렬 (지출은 음수이므로 절대값 기준 정렬? 아니면 그냥 정렬?)
+                    # 지출이 주를 이루므로 오름차순(더 작은 음수 = 더 큰 지출)이 맞을 수도 있지만,
+                    # 보통 큰 금액부터 보고 싶어하므로 절대값 기준 정렬이 나을 수 있음.
+                    # 여기서는 단순 금액 기준 오름차순(큰 지출 순)으로 정렬
+                    content_group = cat_df.groupby('내용')['금액'].sum().reset_index()
+                    content_group = content_group.sort_values(by='금액', ascending=True) # 음수니까 오름차순이 큰 지출
+                    
+                    # 동적 높이 계산
+                    height_group = (len(content_group) + 1) * 35 + 3
+                    st.dataframe(
+                        content_group.style.format({"금액": "{:,.0f}원"}),
+                        column_config={
+                            "내용": st.column_config.TextColumn("내용"),
+                            # "금액": st.column_config.NumberColumn("금액", format="%d원"), # style로 대체
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        height=height_group
+                    )
+            else:
+                st.info(f"'{selected_category}' 카테고리의 내역이 없습니다.")
+        else:
+            st.info("카테고리를 선택해주세요.")
+
+    # --- [Tab 4] 전체 내역 (데이터 관리) ---
     with tab2:
         st.subheader("📂 데이터 관리")
         
@@ -964,7 +1071,7 @@ def main_content():
                     uploaded_df = pd.read_csv(uploaded_file)
                     
                     # 컬럼 유효성 검사
-                    required_columns = ['날짜', '구분', '세부구분', '카테고리', '내용', '금액', '결제수단', '카드명', '메모']
+                    required_columns = ['날짜', '시간', '타입', '대분류', '소분류', '내용', '금액', '화폐', '결제수단', '메모', '세부구분']
                     if all(col in uploaded_df.columns for col in required_columns):
                         st.success("파일 형식이 올바릅니다!")
                         st.dataframe(uploaded_df.head(), use_container_width=True, height=150)
@@ -989,7 +1096,24 @@ def main_content():
                 except Exception as e:
                     st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
 
-    # --- [Tab 4] 설정 (카테고리 & 카드 관리) ---
+    # --- [Tab 5] 분석 (연간 리포트) ---
+    with tab3:
+        if df.empty:
+            st.info("데이터가 없습니다.")
+        else:
+            year_select = st.selectbox("연도 확인", available_years, key='year_select_tab2', index=len(available_years)-1)
+            
+            year_df = df[df['날짜'].dt.year == year_select].copy()
+            if not year_df.empty:
+                year_df['월'] = year_df['날짜'].dt.month
+                # 피벗 테이블 생성 (지출은 음수로 합산됨)
+                pivot = year_df.groupby(['월', '타입'])['금액'].sum().unstack(fill_value=0)
+                st.bar_chart(pivot)
+                st.dataframe(pivot.style.format("{:,.0f}원"), use_container_width=True)
+            else:
+                st.write("해당 연도 데이터가 없습니다.")
+
+    # --- [Tab 6] 설정 (카테고리 & 카드 관리) ---
     with tab4:
         col_set1, col_set2 = st.columns([1, 2])
         
